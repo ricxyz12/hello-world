@@ -1,0 +1,25 @@
+#include <Wire.h>
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) {;}
+  Wire.begin(); // ATmega328P: SDA=A4(PC4), SCL=A5(PC5)
+  Serial.println("I2C scan start");
+}
+
+void loop() {
+  uint8_t found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("Found I2C device at 0x");
+      if (addr < 16) Serial.print('0');
+      Serial.println(addr, HEX);
+      found++;
+    }
+  }
+  if (!found) Serial.println("No I2C found");
+
+  delay(2000); //scan every 2S
+}
