@@ -1,13 +1,41 @@
 #include <LiquidCrystal_I2C.h>
-
 #include <Adafruit_PN532.h>
-
 #include <SPI.h>
-
 #include <Wire.h>
 #include <avr/pgmspace.h>
 #include <string.h>
 #include <stdio.h>
+
+// === AUDIO (DFPlayer) ===
+#include "DFRobotDFPlayerMini.h"
+
+#if (defined(ARDUINO_AVR_UNO) || defined(ESP8266))   // Using a soft serial port
+#include <SoftwareSerial.h>
+// On UNO: 15 = A1 (RX), 16 = A2 (TX) for DFPlayer
+SoftwareSerial softSerial(/*rx =*/15, /*tx =*/16);
+#define FPSerial softSerial
+#else
+#define FPSerial Serial1
+#endif
+
+DFRobotDFPlayerMini myDFPlayer;
+static bool audioReady = false;
+
+static void audioInit() {
+  FPSerial.begin(9600);
+  if (!myDFPlayer.begin(FPSerial, /*isACK=*/true, /*doReset=*/true)) {
+    Serial.println(F("[AUDIO] DFPlayer init failed. Check wiring/SD."));
+    audioReady = false;
+    return;
+  }
+  myDFPlayer.volume(30); // 0..30
+  audioReady = true;
+}
+
+// Play from /mp3 folder: /mp3/000n.mp3
+static inline void playSound(uint16_t idx) {
+  if (audioReady) myDFPlayer.playMp3Folder(idx);
+}
 
 // I2C LCD
 #define LCD_ADDR 0x27
@@ -81,17 +109,11 @@ void lcdPrintln(const __FlashStringHelper *fs) { lcdPrint(fs); lcdPutChar('\n');
 template<typename T> void lcdPrintT(const T &v) { lcdPrint(String(v)); }
 template<typename T> void lcdPrintlnT(const T &v) { lcdPrintln(String(v)); }
 
-// ===== Fixed-layout UI (always write exactly 16 chars per row) =====
+// ===== Fixed-layout UI =====
 static void lcdWriteRowPadded(uint8_t r, const char* s) {
-  // FIX: copy until '\0', then pad with spaces to LCD_COLS to avoid out-of-bounds reads
   uint8_t c = 0;
-  while (c < LCD_COLS && s[c] != '\0') {
-    lcd_buf[r][c] = s[c];
-    c++;
-  }
-  while (c < LCD_COLS) {
-    lcd_buf[r][c++] = ' ';
-  }
+  while (c < LCD_COLS && s[c] != '\0') { lcd_buf[r][c] = s[c]; c++; }
+  while (c < LCD_COLS) { lcd_buf[r][c++] = ' '; }
   lcd_buf[r][LCD_COLS] = '\0';
   lcdRefreshRow(r);
 }
@@ -103,15 +125,10 @@ static void lcdSetLines(const char* l0, const char* l1) {
 }
 
 static void composeLeftRight(char out[17], const char* left, const char* right) {
-  size_t L = strlen(left);
-  size_t R = strlen(right);
+  size_t L = strlen(left), R = strlen(right);
   if (R > 16) R = 16;
   size_t space = (16 > R) ? (16 - R) : 0;
-  if (space > 0) {
-    if (L > space - 1) L = space - 1;
-  } else {
-    L = 0;
-  }
+  if (space > 0) { if (L > space - 1) L = space - 1; } else { L = 0; }
   memset(out, ' ', 16);
   for (size_t i = 0; i < L; i++) out[i] = left[i];
   if (R > 0) for (size_t i = 0; i < R; i++) out[16 - R + i] = right[i];
@@ -135,9 +152,7 @@ static void uiRoundStart(uint8_t action, unsigned long roundNo, unsigned long ti
   }
 
   char line0[17]; composeLeftRight(line0, left, right);
-
-  char line1[17];
-  snprintf(line1, sizeof(line1), "R:%lu  S:%lu", roundNo, score);
+  char line1[17]; snprintf(line1, sizeof(line1), "R:%lu  S:%lu", roundNo, score);
   lcdSetLines(line0, line1);
 }
 
@@ -156,24 +171,11 @@ static void uiGameOver(unsigned long score) {
   lcdSetLines(l0, "Reset to play");
 }
 
-// ===== Debug printing: Serial only, no LCD mirroring =====
-static void tryLcdPrint(const __FlashStringHelper* fs) {(void)fs;}
-static void tryLcdPrintln(const __FlashStringHelper* fs) {(void)fs;}
-static void tryLcdPrint(const String& s) {(void)s;}
-static void tryLcdPrintln(const String& s) {(void)s;}
-static void tryLcdPrint(const char* s) {(void)s;}
-static void tryLcdPrintln(const char* s) {(void)s;}
-static void tryLcdPrint(unsigned long v) {(void)v;}
-static void tryLcdPrint(long v) {(void)v;}
-static void tryLcdPrint(unsigned int v) {(void)v;}
-static void tryLcdPrint(int v) {(void)v;}
-static void tryLcdPrint(char c) {(void)c;}
-static void tryLcdPrintln(unsigned long v) {(void)v;}
-static void tryLcdPrintln(long v) {(void)v;}
-static void tryLcdPrintln(unsigned int v) {(void)v;}
-static void tryLcdPrintln(int v) {(void)v;}
-static void tryLcdPrintln(char c) {(void)c;}
+static void uiWinner() {
+  lcdSetLines("     WINNER     ", "Reset to play");
+}
 
+// ===== Debug printing =====
 static void debugPrint(const __FlashStringHelper* fs) { Serial.print(fs); }
 static void debugPrintln(const __FlashStringHelper* fs) { Serial.println(fs); }
 static void debugPrint(const String& s) { Serial.print(s); }
@@ -217,8 +219,22 @@ const char KEYS[4][3] = {
   {'*','0','#'}
 };
 
+// ---------- Start Button (A0 as digital, ACTIVE-HIGH) ----------
+#define START_PIN A0   // Button drives +5V when pressed
+void startButtonInit() { pinMode(START_PIN, INPUT); } // no pull-up
+bool startPressedRaw() { return digitalRead(START_PIN) == HIGH; }
+// Non-blocking debounce: require 30ms stable pressed
+bool startPressed() {
+  static uint32_t t0 = 0;
+  static bool last = false;
+  bool cur = startPressedRaw();
+  if (cur != last) { t0 = millis(); last = cur; }
+  if (cur && (millis() - t0 >= 30)) return true;
+  return false;
+}
+
 // ---------- Game tunables ----------
-const unsigned long INITIAL_TIME_LIMIT_MS = 30000;
+const unsigned long INITIAL_TIME_LIMIT_MS = 60000;
 const unsigned long MIN_TIME_LIMIT_MS     = 3000;
 const unsigned long DECREMENT_MS          = 1000;
 const char TARGET_TEXT[] = "BANK CARD";
@@ -228,7 +244,7 @@ const uint8_t NTAG_START_PAGE = 4;
 const uint8_t NTAG_END_PAGE   = 39;
 
 // ---------- Game state ----------
-enum GameState { READY, ROUND_PICK, ROUND_START, WAITING_FOR_ACTION, ROUND_SUCCESS, GAME_OVER };
+enum GameState { READY, ROUND_PICK, ROUND_START, WAITING_FOR_ACTION, ROUND_SUCCESS, GAME_OVER, GAME_WIN };
 enum ActionType { ACTION_NFC = 0, ACTION_IR = 1, ACTION_KEYPAD = 2 };
 
 GameState state = READY;
@@ -268,7 +284,22 @@ void setup() {
   lcd.backlight();
   lcdClearAll();
   uiSplash();
-  delay(2000); // show "BANK IT" for 2 seconds at game start
+
+  // AUDIO: init & power-on sound (0001 - Bank It)
+  audioInit();
+  playSound(1);
+
+  // START button (active-HIGH on A0)
+  startButtonInit();
+
+  // Seed randomness from a different analog pin
+  randomSeed(analogRead(A3) ^ micros());
+
+  delay(2000); // keep your splash timing
+
+  // Prompt that we are waiting for START
+  lcdSetLines("=== BANK IT! ===", " Press START btn");
+  Serial.println(F("[READY] Waiting for START (A0 goes HIGH on press)..."));
 
   pinMode(IR_PIN, INPUT);
   keypadInit();
@@ -281,12 +312,37 @@ void setup() {
   nfc.SAMConfig();
   nfc.setPassiveActivationRetries(0xFF);
 
-  randomSeed(analogRead(A0) ^ micros());
-  state = ROUND_PICK;
+  state = READY; // wait for button
 }
 
 void loop() {
   switch (state) {
+    case READY: {
+      // Optional heartbeat
+      static uint32_t hb = 0;
+      if (millis() - hb > 500) {
+        hb = millis();
+        lcd.setCursor(15,1);
+        lcd.write('.');
+      }
+
+      if (startPressed()) {
+        Serial.println(F("[READY] START detected"));
+
+        // Play Game Start sound AFTER pressing start
+        playSound(6); // 0006 - Game Start
+
+        // reset per-run variables
+        roundNumber = 0;
+        score = 0;
+        currentTimeLimitMs = INITIAL_TIME_LIMIT_MS;
+
+        // clear prompt
+        lcdSetLines("=== BANK IT! ===", "                ");
+        state = ROUND_PICK;
+      }
+    } break;
+
     case ROUND_PICK: {
       currentAction = (ActionType)random(0, 3);
       state = ROUND_START;
@@ -302,16 +358,19 @@ void loop() {
 
       LOG(F("-- Round")); LOG(roundNumber); LOG(F(" --"));
       if (currentAction == ACTION_NFC) {
+        playSound(4); // 0004 - Tap It
         LOG(F("TAP CARD"));
         if (digitalRead(IR_PIN) == LOW) {
           LOGLN(F("\nIR covered"));
         }
       } else if (currentAction == ACTION_IR) {
+        playSound(2); // 0002 - Cover It
         LOG(F("COVER sensor"));
         if (isAnyNfcPresent(10)) {
           LOGLN(F("Remove Card"));
         }
-      } else {
+      } else { // ACTION_KEYPAD
+        playSound(3); // 0003 - Punch It
         LOG(F("ENTER PIN"));
       }
       LOGLN(F("Time limit: "));
@@ -371,6 +430,12 @@ void loop() {
       score++;
       LOG(F("Pass Score = ")); LOGLN(score);
 
+      // Check WIN condition first
+      if (score >= 99) {
+        state = GAME_WIN;
+        break;
+      }
+
       if (currentTimeLimitMs > MIN_TIME_LIMIT_MS + DECREMENT_MS) {
         currentTimeLimitMs -= DECREMENT_MS;
       } else {
@@ -393,12 +458,20 @@ void loop() {
     } break;
 
     case GAME_OVER: {
+      playSound(5); // 0005 - Game Over
       LOG(F("Final score: ")); LOGLN(score);
       uiGameOver(score);
       while (1) { delay(1000); }
     } break;
 
-    case READY:
+    case GAME_WIN: {
+      // (No special win sound specified; just show WINNER)
+      uiWinner();
+      playSound(7); // 0007 - You Win
+      // Halt like GAME_OVER
+      while (1) { delay(1000); }
+    } break;
+
     default: break;
   }
 }
