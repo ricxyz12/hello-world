@@ -1,10 +1,13 @@
-#include <SPI.h>
+#include <LiquidCrystal_I2C.h>
+
 #include <Adafruit_PN532.h>
 
+#include <SPI.h>
+
 #include <Wire.h>
-#include <LiquidCrystal_I2C.h>
 #include <avr/pgmspace.h>
-#include <string.h>   // for strstr
+#include <string.h>
+#include <stdio.h>
 
 // I2C LCD
 #define LCD_ADDR 0x27
@@ -39,7 +42,6 @@ void lcdScrollUp() {
     lcd_buf[r][LCD_COLS] = '\0';
     lcdRefreshRow(r);
   }
-
   for (uint8_t c = 0; c < LCD_COLS; c++) lcd_buf[LCD_ROWS - 1][c] = ' ';
   lcd_buf[LCD_ROWS - 1][LCD_COLS] = '\0';
   lcdRefreshRow(LCD_ROWS - 1);
@@ -59,184 +61,147 @@ void lcdNewline() {
 void lcdPutChar(char ch) {
   if (ch == '\r') return;
   if (ch == '\n') { lcdNewline(); return; }
-
   lcd_buf[lcd_row][lcd_col] = ch;
   lcd.setCursor(lcd_col, lcd_row); lcd.write(ch);
   lcd_col++;
-  if (lcd_col >= LCD_COLS) {
-    lcdNewline();
-  }
+  if (lcd_col >= LCD_COLS) lcdNewline();
 }
 
-void lcdPrint(const String &s) {
-  for (size_t i = 0; i < s.length(); i++) lcdPutChar(s[i]);
-}
+void lcdPrint(const String &s) { for (size_t i = 0; i < s.length(); i++) lcdPutChar(s[i]); }
 void lcdPrintln(const String &s) { lcdPrint(s); lcdPutChar('\n'); }
 
-// PROGMEM print helpers
+// PROGMEM helpers
 void lcdPrint(const __FlashStringHelper *fs) {
   PGM_P p = reinterpret_cast<PGM_P>(fs);
   uint8_t b;
-  while ((b = pgm_read_byte(p++)) != 0) {
-    lcdPutChar(static_cast<char>(b));
-  }
+  while ((b = pgm_read_byte(p++)) != 0) lcdPutChar(static_cast<char>(b));
 }
 void lcdPrintln(const __FlashStringHelper *fs) { lcdPrint(fs); lcdPutChar('\n'); }
 
-template<typename T>
-void lcdPrintT(const T &v) { lcdPrint(String(v)); }
-template<typename T>
-void lcdPrintlnT(const T &v) { lcdPrintln(String(v)); }
+template<typename T> void lcdPrintT(const T &v) { lcdPrint(String(v)); }
+template<typename T> void lcdPrintlnT(const T &v) { lcdPrintln(String(v)); }
 
-// -------- Selective LCD mirroring (keep game prompts on LCD, debug to Serial only) --------
-static bool g_allow_next_token = false;
-
-static void flashToCstr(const __FlashStringHelper* fs, char* dst, size_t maxLen) {
-  PGM_P p = reinterpret_cast<PGM_P>(fs);
-  size_t i = 0;
-  uint8_t b;
-  while (i + 1 < maxLen && (b = pgm_read_byte(p++)) != 0) {
-    dst[i++] = (char)b;
+// ===== Fixed-layout UI (always write exactly 16 chars per row) =====
+static void lcdWriteRowPadded(uint8_t r, const char* s) {
+  // FIX: copy until '\0', then pad with spaces to LCD_COLS to avoid out-of-bounds reads
+  uint8_t c = 0;
+  while (c < LCD_COLS && s[c] != '\0') {
+    lcd_buf[r][c] = s[c];
+    c++;
   }
-  dst[i] = '\0';
-}
-
-static bool containsAny(const char* s, const char* const* needles, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    if (strstr(s, needles[i]) != nullptr) return true;
+  while (c < LCD_COLS) {
+    lcd_buf[r][c++] = ' ';
   }
-  return false;
+  lcd_buf[r][LCD_COLS] = '\0';
+  lcdRefreshRow(r);
 }
 
-static bool isUiText(const char* s) {
-  // Only these phrases are mirrored to the LCD
-  static const char* const allow[] = {
-    "=== BANK IT! ===",
-    "-- Round",
-    "TAP CARD",
-    "COVER sensor",
-    "ENTER PIN",
-    "Enter PIN",
-    "Time limit",
-    "Wrong action",
-    "Wrong text",
-    "Time up",
-    "Game over",
-    "Pass Score",
-    "Final score",
-    "Reset to play",
-    "PIN:",
-    "Remove Card",
-    "IR covered",
-    "Remove tag",
-    "OK."
-  };
-  return containsAny(s, allow, sizeof(allow) / sizeof(allow[0]));
+static void lcdSetLines(const char* l0, const char* l1) {
+  lcdWriteRowPadded(0, l0);
+  lcdWriteRowPadded(1, l1);
+  lcd_row = 0; lcd_col = 0;
 }
 
-static bool triggersFollowup(const char* s) {
-  // After these, mirror the very next token (number/string) to LCD as part of the same prompt
-  static const char* const triggers[] = {
-    "-- Round",
-    "Time limit",
-    "Pass Score",
-    "Final score",
-    "PIN:"
-  };
-  return containsAny(s, triggers, sizeof(triggers) / sizeof(triggers[0]));
+static void composeLeftRight(char out[17], const char* left, const char* right) {
+  size_t L = strlen(left);
+  size_t R = strlen(right);
+  if (R > 16) R = 16;
+  size_t space = (16 > R) ? (16 - R) : 0;
+  if (space > 0) {
+    if (L > space - 1) L = space - 1;
+  } else {
+    L = 0;
+  }
+  memset(out, ' ', 16);
+  for (size_t i = 0; i < L; i++) out[i] = left[i];
+  if (R > 0) for (size_t i = 0; i < R; i++) out[16 - R + i] = right[i];
+  out[16] = '\0';
 }
 
-// Overloads to try mirroring to LCD
-
-static void tryLcdPrint(const __FlashStringHelper* fs) {
-  char tmp[64];
-  flashToCstr(fs, tmp, sizeof(tmp));
-  if (isUiText(tmp)) lcdPrint(fs);
-  if (triggersFollowup(tmp)) g_allow_next_token = true;
-}
-static void tryLcdPrintln(const __FlashStringHelper* fs) {
-  char tmp[64];
-  flashToCstr(fs, tmp, sizeof(tmp));
-  if (isUiText(tmp)) lcdPrintln(fs);
-  if (triggersFollowup(tmp)) g_allow_next_token = true;
+static void uiSplash() {
+  lcdSetLines("=== BANK IT! ===", "        Ready");
 }
 
-static void tryLcdPrint(const String& s) {
-  if (g_allow_next_token) { lcdPrint(s); g_allow_next_token = false; return; }
-  if (isUiText(s.c_str())) lcdPrint(s);
-}
-static void tryLcdPrintln(const String& s) {
-  if (g_allow_next_token) { lcdPrintln(s); g_allow_next_token = false; return; }
-  if (isUiText(s.c_str())) lcdPrintln(s);
-}
+static void uiRoundStart(uint8_t action, unsigned long roundNo, unsigned long timeSec, const char* pin, unsigned long score) {
+  char right[8];
+  snprintf(right, sizeof(right), "T:%lus", timeSec);
 
-static void tryLcdPrint(const char* s) {
-  if (!s) return;
-  if (g_allow_next_token) { lcdPrintT(s); g_allow_next_token = false; return; }
-  if (isUiText(s)) lcdPrintT(s);
-}
-static void tryLcdPrintln(const char* s) {
-  if (!s) return;
-  if (g_allow_next_token) { lcdPrintlnT(s); g_allow_next_token = false; return; }
-  if (isUiText(s)) lcdPrintlnT(s);
-}
+  char left[17];
+  if (action == 0)       snprintf(left, sizeof(left), "TAP CARD");
+  else if (action == 1)  snprintf(left, sizeof(left), "COVER IR");
+  else {
+    if (pin && pin[0])   snprintf(left, sizeof(left), "PIN:%s", pin);
+    else                 snprintf(left, sizeof(left), "ENTER PIN");
+  }
 
-static void tryLcdPrint(unsigned long v) {
-  if (g_allow_next_token) { lcdPrintT(v); g_allow_next_token = false; }
-}
-static void tryLcdPrint(long v) {
-  if (g_allow_next_token) { lcdPrintT(v); g_allow_next_token = false; }
-}
-static void tryLcdPrint(unsigned int v) {
-  if (g_allow_next_token) { lcdPrintT((unsigned long)v); g_allow_next_token = false; }
-}
-static void tryLcdPrint(int v) {
-  if (g_allow_next_token) { lcdPrintT((long)v); g_allow_next_token = false; }
-}
-static void tryLcdPrint(char c) {
-  if (g_allow_next_token) { lcdPutChar(c); g_allow_next_token = false; }
+  char line0[17]; composeLeftRight(line0, left, right);
+
+  char line1[17];
+  snprintf(line1, sizeof(line1), "R:%lu  S:%lu", roundNo, score);
+  lcdSetLines(line0, line1);
 }
 
-static void tryLcdPrintln(unsigned long v) { tryLcdPrint(v); }
-static void tryLcdPrintln(long v) { tryLcdPrint(v); }
-static void tryLcdPrintln(unsigned int v) { tryLcdPrint(v); }
-static void tryLcdPrintln(int v) { tryLcdPrint(v); }
-static void tryLcdPrintln(char c) { tryLcdPrint(c); }
+static void uiPass(unsigned long score, unsigned long nextTimeSec) {
+  char l0[17], l1[17];
+  snprintf(l0, sizeof(l0), "   PASS  S:%-6lu", score);
+  snprintf(l1, sizeof(l1), "Next T:%lus", nextTimeSec);
+  lcdSetLines(l0, l1);
+}
 
-// Centralized logging: always to Serial; mirror to LCD selectively
-static void debugPrint(const __FlashStringHelper* fs) { Serial.print(fs); tryLcdPrint(fs); }
-static void debugPrintln(const __FlashStringHelper* fs) { Serial.println(fs); tryLcdPrintln(fs); }
+static void uiRemoveTag() { lcdSetLines("Remove tag", "            "); }
+static void uiRemoveOk()  { lcdSetLines("Remove tag", "OK."); }
 
-static void debugPrint(const String& s) { Serial.print(s); tryLcdPrint(s); }
-static void debugPrintln(const String& s) { Serial.println(s); tryLcdPrintln(s); }
+static void uiGameOver(unsigned long score) {
+  char l0[17]; snprintf(l0, sizeof(l0), "Score: %-9lu", score);
+  lcdSetLines(l0, "Reset to play");
+}
 
-static void debugPrint(const char* s) { Serial.print(s); tryLcdPrint(s); }
-static void debugPrintln(const char* s) { Serial.println(s); tryLcdPrintln(s); }
+// ===== Debug printing: Serial only, no LCD mirroring =====
+static void tryLcdPrint(const __FlashStringHelper* fs) {(void)fs;}
+static void tryLcdPrintln(const __FlashStringHelper* fs) {(void)fs;}
+static void tryLcdPrint(const String& s) {(void)s;}
+static void tryLcdPrintln(const String& s) {(void)s;}
+static void tryLcdPrint(const char* s) {(void)s;}
+static void tryLcdPrintln(const char* s) {(void)s;}
+static void tryLcdPrint(unsigned long v) {(void)v;}
+static void tryLcdPrint(long v) {(void)v;}
+static void tryLcdPrint(unsigned int v) {(void)v;}
+static void tryLcdPrint(int v) {(void)v;}
+static void tryLcdPrint(char c) {(void)c;}
+static void tryLcdPrintln(unsigned long v) {(void)v;}
+static void tryLcdPrintln(long v) {(void)v;}
+static void tryLcdPrintln(unsigned int v) {(void)v;}
+static void tryLcdPrintln(int v) {(void)v;}
+static void tryLcdPrintln(char c) {(void)c;}
 
-static void debugPrint(unsigned long v) { Serial.print(v); tryLcdPrint(v); }
-static void debugPrint(long v) { Serial.print(v); tryLcdPrint(v); }
-static void debugPrint(unsigned int v) { Serial.print(v); tryLcdPrint(v); }
-static void debugPrint(int v) { Serial.print(v); tryLcdPrint(v); }
-static void debugPrint(char c) { Serial.print(c); tryLcdPrint(c); }
+static void debugPrint(const __FlashStringHelper* fs) { Serial.print(fs); }
+static void debugPrintln(const __FlashStringHelper* fs) { Serial.println(fs); }
+static void debugPrint(const String& s) { Serial.print(s); }
+static void debugPrintln(const String& s) { Serial.println(s); }
+static void debugPrint(const char* s) { Serial.print(s); }
+static void debugPrintln(const char* s) { Serial.println(s); }
+static void debugPrint(unsigned long v) { Serial.print(v); }
+static void debugPrint(long v) { Serial.print(v); }
+static void debugPrint(unsigned int v) { Serial.print(v); }
+static void debugPrint(int v) { Serial.print(v); }
+static void debugPrint(char c) { Serial.print(c); }
+static void debugPrintln(unsigned long v) { Serial.println(v); }
+static void debugPrintln(long v) { Serial.println(v); }
+static void debugPrintln(unsigned int v) { Serial.println(v); }
+static void debugPrintln(int v) { Serial.println(v); }
+static void debugPrintln(char c) { Serial.println(c); }
 
-static void debugPrintln(unsigned long v) { Serial.println(v); tryLcdPrintln(v); }
-static void debugPrintln(long v) { Serial.println(v); tryLcdPrintln(v); }
-static void debugPrintln(unsigned int v) { Serial.println(v); tryLcdPrintln(v); }
-static void debugPrintln(int v) { Serial.println(v); tryLcdPrintln(v); }
-static void debugPrintln(char c) { Serial.println(c); tryLcdPrintln(c); }
+#define LOG(x)   do { debugPrint(x); } while(0)
+#define LOGLN(x) do { debugPrintln(x); } while(0)
 
-// Replace original macros: Serial only for debug; LCD mirrors only game prompts via helpers above
-#define LOG(x)        do { debugPrint(x); } while(0)
-#define LOGLN(x)      do { debugPrintln(x); } while(0)
-
-// ---------- PN532 wiring (hardware SPI on Uno) ----------
+// ---------- PN532 wiring ----------
 #define PN532_SS 10
 Adafruit_PN532 nfc(PN532_SS);
 
 // ---------- IR sensor ----------
 #define IR_PIN 2
 
-// ---------- Keypad (3x4) wiring (SparkFun 12-button) ----------
+// ---------- Keypad wiring ----------
 #define KP_C1 5
 #define KP_C2 4
 #define KP_C3 3
@@ -302,6 +267,8 @@ void setup() {
   lcd.init();
   lcd.backlight();
   lcdClearAll();
+  uiSplash();
+  delay(2000); // show "BANK IT" for 2 seconds at game start
 
   pinMode(IR_PIN, INPUT);
   keypadInit();
@@ -321,7 +288,7 @@ void setup() {
 void loop() {
   switch (state) {
     case ROUND_PICK: {
-      currentAction = (ActionType)random(0, 3); // 0..2
+      currentAction = (ActionType)random(0, 3);
       state = ROUND_START;
     } break;
 
@@ -329,8 +296,11 @@ void loop() {
       roundNumber++;
       LOGLN("");
 
-      LOG(F("-- Round")); LOG(roundNumber); LOG(F(" --"));
+      if (currentAction == ACTION_KEYPAD) {
+        keypadStartNewPin();
+      }
 
+      LOG(F("-- Round")); LOG(roundNumber); LOG(F(" --"));
       if (currentAction == ACTION_NFC) {
         LOG(F("TAP CARD"));
         if (digitalRead(IR_PIN) == LOW) {
@@ -343,11 +313,13 @@ void loop() {
         }
       } else {
         LOG(F("ENTER PIN"));
-        keypadStartNewPin();
       }
-
       LOGLN(F("Time limit: "));
       LOG(currentTimeLimitMs / 1000);
+
+      uiRoundStart((uint8_t)currentAction, roundNumber, currentTimeLimitMs / 1000,
+                   (currentAction == ACTION_KEYPAD) ? pinTarget : nullptr,
+                   score);
 
       roundDeadline = millis() + currentTimeLimitMs;
       state = WAITING_FOR_ACTION;
@@ -358,14 +330,8 @@ void loop() {
 
       if (currentAction == ACTION_NFC) {
         delay(500);
-        if (digitalRead(IR_PIN) == LOW) {
-          LOGLN(F("Wrong action"));
-          state = GAME_OVER; break;
-        }
-        if (keypadAnyKeyPressed()) {
-          LOGLN(F("Wrong action"));
-          state = GAME_OVER; break;
-        }
+        if (digitalRead(IR_PIN) == LOW) { LOGLN(F("Wrong action")); state = GAME_OVER; break; }
+        if (keypadAnyKeyPressed())      { LOGLN(F("Wrong action")); state = GAME_OVER; break; }
 
         String text;
         success = doNfcAction(text);
@@ -379,43 +345,25 @@ void loop() {
         }
 
       } else if (currentAction == ACTION_IR) {
-        if (isAnyNfcPresent(10)) {
-          LOGLN(F("Wrong action"));
-          LOGLN(F("Game over."));
-          state = GAME_OVER; break;
-        }
-        if (keypadAnyKeyPressed()) {
-          LOGLN(F("Wrong action"));
-          LOGLN(F("Game over."));
-          state = GAME_OVER; break;
-        }
+        if (isAnyNfcPresent(10))        { LOGLN(F("Wrong action")); LOGLN(F("Game over.")); state = GAME_OVER; break; }
+        if (keypadAnyKeyPressed())      { LOGLN(F("Wrong action")); LOGLN(F("Game over.")); state = GAME_OVER; break; }
 
         success = doIrAction();
 
       } else { // ACTION_KEYPAD
         delay(500);
-        if (digitalRead(IR_PIN) == LOW) {
-          LOGLN(F("Wrong action"));
-          LOGLN(F("Game over."));
-          state = GAME_OVER; break;
-        }
-        if (isAnyNfcPresent(10)) {
-          LOGLN(F("Wrong action"));
-          LOGLN(F("Game over."));
-          state = GAME_OVER; break;
-        }
+        if (digitalRead(IR_PIN) == LOW) { LOGLN(F("Wrong action")); LOGLN(F("Game over.")); state = GAME_OVER; break; }
+        if (isAnyNfcPresent(10))        { LOGLN(F("Wrong action")); LOGLN(F("Game over.")); state = GAME_OVER; break; }
 
         success = doKeypadAction();
       }
 
       if (success) {
         state = ROUND_SUCCESS;
-      } else {
-        if (millis() > roundDeadline) {
-          LOGLN(F("Time up."));
-          LOGLN(F("Game over."));
-          state = GAME_OVER;
-        }
+      } else if (millis() > roundDeadline) {
+        LOGLN(F("Time up."));
+        LOGLN(F("Game over."));
+        state = GAME_OVER;
       }
     } break;
 
@@ -431,6 +379,8 @@ void loop() {
       LOG(F("Time limit: "));
       LOGLN(currentTimeLimitMs / 1000);
 
+      uiPass(score, currentTimeLimitMs / 1000);
+
       if (currentAction == ACTION_NFC) {
         waitForTagRemoval();
       } else if (currentAction == ACTION_IR) {
@@ -444,7 +394,7 @@ void loop() {
 
     case GAME_OVER: {
       LOG(F("Final score: ")); LOGLN(score);
-      LOGLN(F("Reset to play"));
+      uiGameOver(score);
       while (1) { delay(1000); }
     } break;
 
@@ -456,13 +406,10 @@ void loop() {
 /* NFC action */
 bool doNfcAction(String &observedText) {
   uint8_t uid[7], uidLen = 0;
-  if (!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) {
-    return false;
-  }
+  if (!nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 50)) return false;
   uint8_t page3[4];
-  if (!nfc.ntag2xx_ReadPage(3, page3)) {
-    return false;
-  }
+  if (!nfc.ntag2xx_ReadPage(3, page3)) return false;
+
   const uint16_t totalBytes = (NTAG_END_PAGE - NTAG_START_PAGE + 1) * 4;
   uint8_t buf[totalBytes];
   uint16_t idx = 0;
@@ -530,13 +477,12 @@ bool findNdefTextFromBuffer(uint8_t *buf, uint16_t len, String &outText) {
   return true;
 }
 
-/* Keypad setup: rows INPUT_PULLUP, columns OUTPUT HIGH */
+/* Keypad setup */
 void keypadInit() {
   pinMode(KP_R1, INPUT_PULLUP);
   pinMode(KP_R2, INPUT_PULLUP);
   pinMode(KP_R3, INPUT_PULLUP);
   pinMode(KP_R4, INPUT_PULLUP);
-
   pinMode(KP_C1, OUTPUT);
   pinMode(KP_C2, OUTPUT);
   pinMode(KP_C3, OUTPUT);
@@ -545,14 +491,12 @@ void keypadInit() {
   digitalWrite(KP_C3, HIGH);
 }
 
-/* Scan keypad; returns pressed key char or 0 if none. */
+/* Scan keypad */
 char keypadGetKey(bool waitRelease) {
   const uint8_t cols[3] = {KP_C1, KP_C2, KP_C3};
   const uint8_t rows[4] = {KP_R1, KP_R2, KP_R3, KP_R4};
-
   for (uint8_t c = 0; c < 3; c++) {
     for (uint8_t cc = 0; cc < 3; cc++) digitalWrite(cols[cc], (cc == c) ? LOW : HIGH);
-
     for (uint8_t r = 0; r < 4; r++) {
       if (digitalRead(rows[r]) == LOW) {
         char k = KEYS[r][c];
@@ -571,15 +515,11 @@ char keypadGetKey(bool waitRelease) {
 }
 
 /* Any keypad activity? */
-bool keypadAnyKeyPressed() {
-  return keypadGetKey(false) != 0;
-}
+bool keypadAnyKeyPressed() { return keypadGetKey(false) != 0; }
 
-/* Begin new keypad round: create random 4-digit PIN and reset entry buffer */
+/* Begin new keypad round */
 void keypadStartNewPin() {
-  for (uint8_t i = 0; i < 4; i++) {
-    pinTarget[i] = '0' + (char)random(0, 10);
-  }
+  for (uint8_t i = 0; i < 4; i++) pinTarget[i] = '0' + (char)random(0, 10);
   pinTarget[4] = 0;
   pinEntered[0] = pinEntered[1] = pinEntered[2] = pinEntered[3] = 0;
   pinEntered[4] = 0;
@@ -597,9 +537,7 @@ bool doKeypadAction() {
   }
 
   char k = keypadGetKey(true);
-  if (k == 0) {
-    return false;
-  }
+  if (k == 0) return false;
 
   if (k < '0' || k > '9') {
     LOGLN(F("Wrong key"));
@@ -632,8 +570,11 @@ bool doKeypadAction() {
 void waitForTagRemoval() {
   uint8_t uid[7], uidLen;
   LOGLN(F("Remove tag\n"));
+  uiRemoveTag();
   while (nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uid, &uidLen, 200)) {
     delay(100);
   }
   LOGLN(F("OK."));
+  uiRemoveOk();
+  delay(500);
 }
