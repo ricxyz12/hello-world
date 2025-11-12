@@ -3,7 +3,7 @@
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <avr/pgmspace.h>  // Added: PROGMEM byte reads
+#include <avr/pgmspace.h>
 
 // I2C LCD
 #define LCD_ADDR 0x27     // may not this address
@@ -29,6 +29,7 @@ void lcdClearAll() {
 
 void lcdRefreshRow(uint8_t r) {
   lcd.setCursor(0, r);
+ 
   for (uint8_t c = 0; c < LCD_COLS; c++) lcd.write(lcd_buf[r][c]);
 }
 
@@ -72,16 +73,20 @@ void lcdPrint(const String &s) {
 }
 void lcdPrintln(const String &s) { lcdPrint(s); lcdPutChar('\n'); }
 
-// Changed: read from PROGMEM byte-by-byte; avoid allocating a String
+// --- fixed PROGMEM handling (method A) ---
 void lcdPrint(const __FlashStringHelper *fs) {
   PGM_P p = reinterpret_cast<PGM_P>(fs);
-  uint8_t b;
-  while ((b = pgm_read_byte(p++)) != 0) {
-    lcdPutChar(static_cast<char>(b));
+  while (true) {
+    char c = pgm_read_byte(p++);
+    if (c == 0) break;
+    lcdPutChar(c);
   }
 }
-// Changed: newline after PROGMEM print
-void lcdPrintln(const __FlashStringHelper *fs) { lcdPrint(fs); lcdPutChar('\n'); }
+void lcdPrintln(const __FlashStringHelper *fs) {
+  lcdPrint(fs);
+  lcdPutChar('\n');
+}
+// -----------------------------------------
 
 template<typename T>
 void lcdPrintT(const T &v) { lcdPrint(String(v)); }
